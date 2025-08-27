@@ -1,0 +1,58 @@
+name: Build and Release tty-ws-agent
+
+on:
+  push:
+    branches: [ "master" ]
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libboost-all-dev libssl-dev
+
+    - name: Compile tty-ws-agent
+      run: |
+        g++ -std=c++17 -O2 -DNDEBUG agent.cpp -o tty-ws-agent -lboost_system -lssl -crypto -lpthread
+        # Check if the binary was created and is executable
+        ls -la tty-ws-agent
+        file tty-ws-agent
+
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: tty-ws-agent-linux
+        path: tty-ws-agent
+        # Optional: set a short retention period (in days) for non-release builds
+        retention-days: 5
+
+  # This job only runs when a new GitHub Release is created
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    steps:
+    - name: Download artifact from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: tty-ws-agent-linux
+        path: ./release-bin
+
+    - name: Upload release asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./release-bin/tty-ws-agent
+        asset_name: tty-ws-agent-linux
+        asset_content_type: application/octet-stream
