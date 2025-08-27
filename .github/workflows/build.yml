@@ -21,7 +21,8 @@ jobs:
 
     - name: Compile tty-ws-agent
       run: |
-        g++ -std=c++17 -O2 -DNDEBUG agent.cpp -o tty-ws-agent -lboost_system -lssl -crypto -lpthread
+        g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent -lboost_system -lssl -lcrypto -lpthread
+        strip tty-ws-agent
         # Check if the binary was created and is executable
         ls -la tty-ws-agent
         file tty-ws-agent
