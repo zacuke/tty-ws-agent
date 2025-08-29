@@ -1,61 +1,102 @@
 name: Build and Release tty-ws-agent
 
 on:
-  push:
-    branches: [ "master" ]
   release:
     types: [created]
 
 jobs:
-  build:
+  build-multi-docker:
     runs-on: ubuntu-latest
-
+    name: Build with Docker containers
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install dependencies
+    - name: Build for Ubuntu 20.04
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libboost-all-dev libssl-dev
+        docker run --rm -v $(pwd):/src -w /src ubuntu:20.04 bash -c "
+          apt-get update &&
+          apt-get install -y g++ libboost-all-dev libssl-dev &&
+          g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu20.04 -lboost_system -lssl -lcrypto -lpthread &&
+          strip tty-ws-agent-ubuntu20.04
+        "
 
-    - name: Compile tty-ws-agent
+    - name: Build for Ubuntu 22.04
       run: |
-        g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent -lboost_system -lssl -lcrypto -lpthread
-        strip tty-ws-agent
-        # Check if the binary was created and is executable
-        ls -la tty-ws-agent
-        file tty-ws-agent
+        docker run --rm -v $(pwd):/src -w /src ubuntu:22.04 bash -c "
+          apt-get update &&
+          apt-get install -y g++ libboost-all-dev libssl-dev &&
+          g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu22.04 -lboost_system -lssl -lcrypto -lpthread &&
+          strip tty-ws-agent-ubuntu22.04
+        "
 
-    - name: Upload binary artifact
+    - name: Build for Ubuntu 24.04
+      run: |
+        docker run --rm -v $(pwd):/src -w /src ubuntu:24.04 bash -c "
+          apt-get update &&
+          apt-get install -y g++ libboost-all-dev libssl-dev &&
+          g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu24.04 -lboost_system -lssl -lcrypto -lpthread &&
+          strip tty-ws-agent-ubuntu24.04
+        "
+
+    - name: Verify all binaries
+      run: |
+        for version in 20.04 22.04 24.04; do
+          echo "=== Ubuntu $version ==="
+          ls -la tty-ws-agent-ubuntu$version
+          file tty-ws-agent-ubuntu$version
+          echo ""
+        done
+
+    - name: Upload all artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: tty-ws-agent-linux
-        path: tty-ws-agent
-        # Optional: set a short retention period (in days) for non-release builds
+        name: tty-ws-agent-binaries
+        path: |
+          tty-ws-agent-ubuntu20.04
+          tty-ws-agent-ubuntu22.04
+          tty-ws-agent-ubuntu24.04
         retention-days: 5
 
-  # This job only runs when a new GitHub Release is created
   release:
-    needs: build
+    needs: build-multi-docker
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
 
     steps:
-    - name: Download artifact from build job
+    - name: Download artifact bundle
       uses: actions/download-artifact@v4
       with:
-        name: tty-ws-agent-linux
+        name: tty-ws-agent-binaries
         path: ./release-bin
 
-    - name: Upload release asset
+    - name: Upload release assets
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
       with:
         upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./release-bin/tty-ws-agent
-        asset_name: tty-ws-agent-linux
+        asset_path: ./release-bin/tty-ws-agent-ubuntu20.04
+        asset_name: tty-ws-agent-ubuntu20.04
         asset_content_type: application/octet-stream
 
-        #
+    - name: Upload Ubuntu 22.04 asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./release-bin/tty-ws-agent-ubuntu22.04
+        asset_name: tty-ws-agent-ubuntu22.04
+        asset_content_type: application/octet-stream
+
+    - name: Upload Ubuntu 24.04 asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./release-bin/tty-ws-agent-ubuntu24.04
+        asset_name: tty-ws-agent-ubuntu24.04
+        asset_content_type: application/octet-stream
