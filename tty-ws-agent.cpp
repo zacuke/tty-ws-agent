@@ -146,6 +146,10 @@ int main(int argc, char *argv[]) {
         tcp::resolver resolver(ioc);
         auto results = resolver.resolve(host, port);
         ssl_stream sslSock(ioc, ctx);
+        if(!SSL_set_tlsext_host_name(sslSock.native_handle(), host)) {
+            beast::error_code ec{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
+            throw beast::system_error{ec};
+        }
         asio::connect(sslSock.next_layer(), results);
         sslSock.handshake(asio::ssl::stream_base::client);
 
