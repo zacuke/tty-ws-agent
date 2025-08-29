@@ -13,17 +13,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Build for Ubuntu 20.04
-      run: |
-        docker run --rm -v $(pwd):/src -w /src ubuntu:20.04 bash -c "
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=UTC
-          apt-get update &&
-          apt-get install -y g++ libboost-all-dev libssl-dev &&
-          g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu20.04 -lboost_system -lssl -lcrypto -lpthread &&
-          strip tty-ws-agent-ubuntu20.04
-        "
-
     - name: Build for Ubuntu 22.04
       run: |
         docker run --rm -v $(pwd):/src -w /src ubuntu:22.04 bash -c "
@@ -48,7 +37,7 @@ jobs:
 
     - name: Verify all binaries
       run: |
-        for version in 20.04 22.04 24.04; do
+        for version in 22.04 24.04; do
           echo "=== Ubuntu $version ==="
           ls -la tty-ws-agent-ubuntu$version
           file tty-ws-agent-ubuntu$version
@@ -60,7 +49,6 @@ jobs:
       with:
         name: tty-ws-agent-binaries
         path: |
-          tty-ws-agent-ubuntu20.04
           tty-ws-agent-ubuntu22.04
           tty-ws-agent-ubuntu24.04
         retention-days: 5
@@ -76,16 +64,6 @@ jobs:
       with:
         name: tty-ws-agent-binaries
         path: ./release-bin
-
-    - name: Upload Ubuntu 20.04 asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./release-bin/tty-ws-agent-ubuntu20.04
-        asset_name: tty-ws-agent-ubuntu20.04
-        asset_content_type: application/octet-stream
 
     - name: Upload Ubuntu 22.04 asset
       uses: actions/upload-release-asset@v1
