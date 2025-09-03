@@ -1,20 +1,19 @@
-// agent.cpp
+// tty-ws-agent.cpp
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/ssl.hpp>
+
 #include <iostream>
 #include <thread>
 #include <array>
-#include <pty.h>
 #include <unistd.h>
+#include <pty.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <signal.h>
-#include <string>
-#include <cstring>
 #include <mutex>
 
 namespace asio      = boost::asio;
@@ -28,7 +27,7 @@ using ws_stream  = websocket::stream<ssl_stream>;
 // Replay buffer globals
 std::mutex replayMutex;
 std::string replayBuffer;
-const size_t MAX_REPLAY = 200000; // 200 KB cap
+constexpr size_t MAX_REPLAY = 200000;
 
 // --------------------------------------------------
 // very small "parser" for resize messages
@@ -50,82 +49,82 @@ bool is_dump_message(const std::string &msg) {
     return msg.find("\"type\"") != std::string::npos &&
            msg.find("dump")     != std::string::npos;
 }
-// --------------------------------------------------
 
-// Forward data from PTY -> websocket
-void pump_pty_to_ws(asio::posix::stream_descriptor &pty, ws_stream &ws, pid_t childPid) {
-    try {
-        std::array<char, 4096> buf;
-        while (true) {
-            if (!ws.is_open()) break;
-            std::size_t n = pty.read_some(asio::buffer(buf));
-            if (n == 0) break;
-
-            // append to replay buffer
-            {
-                std::lock_guard<std::mutex> lk(replayMutex);
-                replayBuffer.append(buf.data(), n);
-                if (replayBuffer.size() > MAX_REPLAY) {
-                    replayBuffer.erase(0, replayBuffer.size() - MAX_REPLAY);
+// Async pumps ---------------------------------------------------
+void start_pty_to_ws(std::shared_ptr<asio::posix::stream_descriptor> pty,
+                     std::shared_ptr<ws_stream> ws,
+                     std::shared_ptr<std::array<char,4096>> buf,
+                     pid_t childPid)
+{
+    pty->async_read_some(asio::buffer(*buf),
+        [pty, ws, buf, childPid](beast::error_code ec, std::size_t n) {
+            if (!ec && n > 0) {
+                {
+                    std::lock_guard<std::mutex> lk(replayMutex);
+                    replayBuffer.append(buf->data(), n);
+                    if (replayBuffer.size() > MAX_REPLAY)
+                        replayBuffer.erase(0, replayBuffer.size()-MAX_REPLAY);
                 }
+                ws->async_write(asio::buffer(buf->data(), n),
+                    [pty, ws, buf, childPid](beast::error_code ec2, std::size_t) {
+                        if (!ec2) start_pty_to_ws(pty, ws, buf, childPid);
+                    });
+            } else {
+                beast::error_code ignore;
+                pty->close(ignore);
+                ws->close(websocket::close_code::normal, ignore);
+                if (childPid>0) kill(childPid,SIGTERM);
             }
-
-            // forward live to websocket
-            ws.write(asio::buffer(buf.data(), n));
-        }
-    } catch (const std::exception &e) {
-        std::cerr << "[pump_pty_to_ws] Exception: " << e.what() << "\n";
-    }
-
-    // cleanup
-    try { ws.close(websocket::close_code::normal); } catch (...) {}
-    try { pty.close(); } catch (...) {}
-    if (childPid > 0) kill(childPid, SIGTERM);
+        });
 }
 
-// Forward data from websocket -> PTY
-void pump_ws_to_pty(ws_stream &ws, asio::posix::stream_descriptor &pty, pid_t childPid) {
-    try {
-        while (true) {
-            beast::flat_buffer buffer;
-            ws.read(buffer);  // read one complete WS frame
+void start_ws_to_pty(std::shared_ptr<ws_stream> ws,
+                     std::shared_ptr<asio::posix::stream_descriptor> pty,
+                     pid_t childPid)
+{
+    auto buffer = std::make_shared<beast::flat_buffer>();
+    ws->async_read(*buffer,
+        [ws, pty, buffer, childPid](beast::error_code ec, std::size_t) {
+            if (!ec) {
+                auto data = buffer->data();
+                std::string msg(boost::asio::buffer_cast<const char*>(data), data.size());
 
-            auto data = buffer.data();
-            std::string msg(boost::asio::buffer_cast<const char*>(data), data.size());
-
-            int cols, rows;
-            if (parse_resize_message(msg, cols, rows)) {
-                struct winsize wsz;
-                wsz.ws_col = cols;
-                wsz.ws_row = rows;
-                wsz.ws_xpixel = 0;
-                wsz.ws_ypixel = 0;
-                ioctl(pty.native_handle(), TIOCSWINSZ, &wsz);
-                kill(childPid, SIGWINCH);
-                continue; // don't forward resize JSON to shell
-            }
-
-            if (is_dump_message(msg)) {
-                std::lock_guard<std::mutex> lk(replayMutex);
-                if (!replayBuffer.empty()) {
-                    ws.write(asio::buffer(replayBuffer));
+                int cols, rows;
+                if (parse_resize_message(msg, cols, rows)) {
+                    struct winsize wsz;
+                    wsz.ws_row    = static_cast<unsigned short>(rows);
+                    wsz.ws_col    = static_cast<unsigned short>(cols);
+                    wsz.ws_xpixel = 0;
+                    wsz.ws_ypixel = 0;
+                    ioctl(pty->native_handle(), TIOCSWINSZ, &wsz);
+                    kill(childPid, SIGWINCH);
+                    start_ws_to_pty(ws, pty, childPid);
+                    return;
                 }
-                continue; // don't forward to shell
-            }
+                if (is_dump_message(msg)) {
+                    std::lock_guard<std::mutex> lk(replayMutex);
+                    if (!replayBuffer.empty()) {
+                        ws->async_write(asio::buffer(replayBuffer),
+                            [ws, pty, childPid](beast::error_code, std::size_t) {
+                                start_ws_to_pty(ws, pty, childPid);
+                            });
+                        return;
+                    }
+                    start_ws_to_pty(ws, pty, childPid);
+                    return;
+                }
 
-            // Otherwise normal stdin -> PTY
-            if (data.size() > 0) {
-                asio::write(pty, data);
+                asio::async_write(*pty, data,
+                    [ws, pty, childPid](beast::error_code ec2, std::size_t) {
+                        if (!ec2) start_ws_to_pty(ws, pty, childPid);
+                    });
+            } else {
+                beast::error_code ignore;
+                pty->close(ignore);
+                ws->close(websocket::close_code::normal, ignore);
+                if (childPid>0) kill(childPid,SIGTERM);
             }
-        }
-    } catch (const std::exception &e) {
-        std::cerr << "[pump_ws_to_pty] Exception: " << e.what() << "\n";
-    }
-
-    // cleanup
-    try { pty.close(); } catch (...) {}
-    try { ws.close(websocket::close_code::normal); } catch (...) {}
-    if (childPid > 0) kill(childPid, SIGTERM);
+        });
 }
 
 int main(int argc, char *argv[]) {
@@ -164,11 +163,10 @@ int main(int argc, char *argv[]) {
         asio::connect(sslSock.next_layer(), results);
         sslSock.handshake(asio::ssl::stream_base::client);
 
-        // Upgrade to WebSocket
-        ws_stream ws(std::move(sslSock));
-        ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
-        ws.binary(true);
-        ws.handshake(host, path);
+        auto ws = std::make_shared<ws_stream>(std::move(sslSock));
+        ws->set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+        ws->binary(true);
+        ws->handshake(host, path);
         std::cout << "Connected to wss://" << host << path << std::endl;
 
         // Fork PTY with child bash
@@ -185,21 +183,36 @@ int main(int argc, char *argv[]) {
             execl("/bin/sh", "sh", (char*)nullptr);
             _exit(127);
         }
+        auto pty = std::make_shared<asio::posix::stream_descriptor>(ioc, master_fd);
+        std::cout << "Spawned shell (pid " << pid << ") with PTY\n";
 
-        asio::posix::stream_descriptor pty(ioc, master_fd);
-        std::cout << "Spawned shell (pid " << pid << ") with pty" << std::endl;
+        auto buf = std::make_shared<std::array<char,4096>>();
+        start_pty_to_ws(pty, ws, buf, pid);
+        start_ws_to_pty(ws, pty, pid);
 
-        std::thread t1([&] { pump_pty_to_ws(pty, ws, pid); });
-        std::thread t2([&] { pump_ws_to_pty(ws, pty, pid); });
+        // ---- SIGCHLD handler ----
+        asio::signal_set sigs(ioc, SIGCHLD);
+        sigs.async_wait([&](beast::error_code, int signo){
+            if (signo == SIGCHLD) {
+                int status;
+                pid_t dead;
+                while ((dead = waitpid(-1, &status, WNOHANG)) > 0) {
+                    if (dead == pid) {
+                        std::cerr << "[main] child " << pid << " exited\n";
+                        beast::error_code ignore;
+                        pty->close(ignore); ws->close(websocket::close_code::normal, ignore);
+                        ioc.stop();
+                    }
+                }
+            }
+        });
+        // ------------------------
 
-        t1.join();
-        t2.join();
+        ioc.run();
 
-        int status;
-        waitpid(pid, &status, 0);
-
-    } catch (std::exception &e) {
-        std::cerr << "ERROR: " << e.what() << std::endl;
+        return 0;
+    } catch (std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
         return 2;
     }
 }
