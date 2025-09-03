@@ -29,7 +29,6 @@ using ws_stream  = websocket::stream<ssl_stream>;
 std::mutex replayMutex;
 std::string replayBuffer;
 const size_t MAX_REPLAY = 200000; // 200 KB cap
-std::atomic<bool> running{true};
 
 // --------------------------------------------------
 // very small "parser" for resize messages
@@ -54,10 +53,10 @@ bool is_dump_message(const std::string &msg) {
 // --------------------------------------------------
 
 // Forward data from PTY -> websocket
-void pump_pty_to_ws(asio::posix::stream_descriptor &pty, ws_stream &ws) {
+void pump_pty_to_ws(asio::posix::stream_descriptor &pty, ws_stream &ws, pid_t childPid) {
     try {
         std::array<char, 4096> buf;
-        while (running) {
+        while (true) {
             if (!ws.is_open()) break;
             std::size_t n = pty.read_some(asio::buffer(buf));
             if (n == 0) break;
@@ -76,20 +75,20 @@ void pump_pty_to_ws(asio::posix::stream_descriptor &pty, ws_stream &ws) {
         }
     } catch (const std::exception &e) {
         std::cerr << "[pump_pty_to_ws] Exception: " << e.what() << "\n";
-        running = false;
-        try { ws.close(websocket::close_code::normal); } catch (...) {}
-        try { pty.close(); } catch (...) {}
     }
+
+    // cleanup
+    try { ws.close(websocket::close_code::normal); } catch (...) {}
+    try { pty.close(); } catch (...) {}
+    if (childPid > 0) kill(childPid, SIGTERM);
 }
 
 // Forward data from websocket -> PTY
 void pump_ws_to_pty(ws_stream &ws, asio::posix::stream_descriptor &pty, pid_t childPid) {
     try {
-        while (running) {
+        while (true) {
             beast::flat_buffer buffer;
             ws.read(buffer);  // read one complete WS frame
-
-            if (!running) break;
 
             auto data = buffer.data();
             std::string msg(boost::asio::buffer_cast<const char*>(data), data.size());
@@ -121,10 +120,12 @@ void pump_ws_to_pty(ws_stream &ws, asio::posix::stream_descriptor &pty, pid_t ch
         }
     } catch (const std::exception &e) {
         std::cerr << "[pump_ws_to_pty] Exception: " << e.what() << "\n";
-        running = false;
-        try { pty.close(); } catch (...) {}
-        try { ws.close(websocket::close_code::normal); } catch (...) {}
     }
+
+    // cleanup
+    try { pty.close(); } catch (...) {}
+    try { ws.close(websocket::close_code::normal); } catch (...) {}
+    if (childPid > 0) kill(childPid, SIGTERM);
 }
 
 int main(int argc, char *argv[]) {
@@ -188,7 +189,7 @@ int main(int argc, char *argv[]) {
         asio::posix::stream_descriptor pty(ioc, master_fd);
         std::cout << "Spawned shell (pid " << pid << ") with pty" << std::endl;
 
-        std::thread t1([&] { pump_pty_to_ws(pty, ws); });
+        std::thread t1([&] { pump_pty_to_ws(pty, ws, pid); });
         std::thread t2([&] { pump_ws_to_pty(ws, pty, pid); });
 
         t1.join();
