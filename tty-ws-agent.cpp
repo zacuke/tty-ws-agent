@@ -29,6 +29,7 @@ using ws_stream  = websocket::stream<ssl_stream>;
 std::mutex replayMutex;
 std::string replayBuffer;
 const size_t MAX_REPLAY = 200000; // 200 KB cap
+std::atomic<bool> running{true};
 
 // --------------------------------------------------
 // very small "parser" for resize messages
@@ -56,7 +57,8 @@ bool is_dump_message(const std::string &msg) {
 void pump_pty_to_ws(asio::posix::stream_descriptor &pty, ws_stream &ws) {
     try {
         std::array<char, 4096> buf;
-        for (;;) {
+        while (running) {
+            if (!ws.is_open()) break;
             std::size_t n = pty.read_some(asio::buffer(buf));
             if (n == 0) break;
 
@@ -72,17 +74,22 @@ void pump_pty_to_ws(asio::posix::stream_descriptor &pty, ws_stream &ws) {
             // forward live to websocket
             ws.write(asio::buffer(buf.data(), n));
         }
-    } catch (std::exception &) {
+    } catch (const std::exception &e) {
+        std::cerr << "[pump_pty_to_ws] Exception: " << e.what() << "\n";
+        running = false;
         try { ws.close(websocket::close_code::normal); } catch (...) {}
+        try { pty.close(); } catch (...) {}
     }
 }
 
 // Forward data from websocket -> PTY
 void pump_ws_to_pty(ws_stream &ws, asio::posix::stream_descriptor &pty, pid_t childPid) {
     try {
-        for (;;) {
+        while (running) {
             beast::flat_buffer buffer;
             ws.read(buffer);  // read one complete WS frame
+
+            if (!running) break;
 
             auto data = buffer.data();
             std::string msg(boost::asio::buffer_cast<const char*>(data), data.size());
@@ -112,8 +119,11 @@ void pump_ws_to_pty(ws_stream &ws, asio::posix::stream_descriptor &pty, pid_t ch
                 asio::write(pty, data);
             }
         }
-    } catch (std::exception &) {
+    } catch (const std::exception &e) {
+        std::cerr << "[pump_ws_to_pty] Exception: " << e.what() << "\n";
+        running = false;
         try { pty.close(); } catch (...) {}
+        try { ws.close(websocket::close_code::normal); } catch (...) {}
     }
 }
 
