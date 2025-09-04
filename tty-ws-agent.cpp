@@ -54,10 +54,11 @@ bool is_dump_message(const std::string &msg) {
 void start_pty_to_ws(std::shared_ptr<asio::posix::stream_descriptor> pty,
                      std::shared_ptr<ws_stream> ws,
                      std::shared_ptr<std::array<char,4096>> buf,
-                     pid_t childPid)
+                     pid_t childPid,
+                     asio::io_context& ioc)
 {
     pty->async_read_some(asio::buffer(*buf),
-        [pty, ws, buf, childPid](beast::error_code ec, std::size_t n) {
+        [pty, ws, buf, childPid, &ioc](beast::error_code ec, std::size_t n) {
             if (!ec && n > 0) {
                 {
                     std::lock_guard<std::mutex> lk(replayMutex);
@@ -66,25 +67,36 @@ void start_pty_to_ws(std::shared_ptr<asio::posix::stream_descriptor> pty,
                         replayBuffer.erase(0, replayBuffer.size()-MAX_REPLAY);
                 }
                 ws->async_write(asio::buffer(buf->data(), n),
-                    [pty, ws, buf, childPid](beast::error_code ec2, std::size_t) {
-                        if (!ec2) start_pty_to_ws(pty, ws, buf, childPid);
+                    [pty, ws, buf, childPid, &ioc](beast::error_code ec2, std::size_t) {
+                        if (!ec2) start_pty_to_ws(pty, ws, buf, childPid, ioc);
+                        else {
+                            std::cerr << "[pty->ws] write error: " << ec2.message() << "\n";
+                            beast::error_code ignore;
+                            pty->close(ignore);
+                            ws->close(websocket::close_code::normal, ignore);
+                            if (childPid > 0) kill(childPid, SIGTERM);
+                            ioc.stop();
+                        }
                     });
             } else {
+                std::cerr << "[pty->ws] pipe closed (ec=" << ec.message() << ")\n";
                 beast::error_code ignore;
                 pty->close(ignore);
                 ws->close(websocket::close_code::normal, ignore);
                 if (childPid>0) kill(childPid,SIGTERM);
+                ioc.stop();
             }
         });
 }
 
 void start_ws_to_pty(std::shared_ptr<ws_stream> ws,
                      std::shared_ptr<asio::posix::stream_descriptor> pty,
-                     pid_t childPid)
+                     pid_t childPid,
+                     asio::io_context& ioc)
 {
     auto buffer = std::make_shared<beast::flat_buffer>();
     ws->async_read(*buffer,
-        [ws, pty, buffer, childPid](beast::error_code ec, std::size_t) {
+        [ws, pty, buffer, childPid, &ioc](beast::error_code ec, std::size_t) {
             if (!ec) {
                 auto data = buffer->data();
                 std::string msg(boost::asio::buffer_cast<const char*>(data), data.size());
@@ -98,31 +110,50 @@ void start_ws_to_pty(std::shared_ptr<ws_stream> ws,
                     wsz.ws_ypixel = 0;
                     ioctl(pty->native_handle(), TIOCSWINSZ, &wsz);
                     kill(childPid, SIGWINCH);
-                    start_ws_to_pty(ws, pty, childPid);
+                    start_ws_to_pty(ws, pty, childPid, ioc);
                     return;
                 }
                 if (is_dump_message(msg)) {
                     std::lock_guard<std::mutex> lk(replayMutex);
                     if (!replayBuffer.empty()) {
-                        ws->async_write(asio::buffer(replayBuffer),
-                            [ws, pty, childPid](beast::error_code, std::size_t) {
-                                start_ws_to_pty(ws, pty, childPid);
+                        // ANSI clear + restore
+                        static const char clearSeq[] = "\033[2J\033[H";
+                        std::string payload(clearSeq);
+                        payload += replayBuffer;
+
+                        ws->async_write(asio::buffer(payload),
+                            [ws, pty, childPid, &ioc](beast::error_code, std::size_t) {
+                                start_ws_to_pty(ws, pty, childPid, ioc);
                             });
                         return;
                     }
-                    start_ws_to_pty(ws, pty, childPid);
+                    start_ws_to_pty(ws, pty, childPid, ioc);
                     return;
                 }
 
                 asio::async_write(*pty, data,
-                    [ws, pty, childPid](beast::error_code ec2, std::size_t) {
-                        if (!ec2) start_ws_to_pty(ws, pty, childPid);
+                    [ws, pty, childPid, &ioc](beast::error_code ec2, std::size_t) {
+                        if (!ec2) start_ws_to_pty(ws, pty, childPid, ioc);
+                        else {
+                            std::cerr << "[ws->pty write error] " << ec2.message() << "\n";
+                            beast::error_code ignore;
+                            pty->close(ignore);
+                            ws->close(websocket::close_code::normal, ignore);
+                            if (childPid>0) kill(childPid,SIGTERM);
+                            ioc.stop();
+                        }
                     });
             } else {
+                if (ec == websocket::error::closed) {
+                    std::cerr << "[ws] Remote closed connection\n";
+                } else {
+                    std::cerr << "[ws] Error: " << ec.message() << "\n";
+                }
                 beast::error_code ignore;
                 pty->close(ignore);
                 ws->close(websocket::close_code::normal, ignore);
                 if (childPid>0) kill(childPid,SIGTERM);
+                ioc.stop();
             }
         });
 }
@@ -187,8 +218,8 @@ int main(int argc, char *argv[]) {
         std::cout << "Spawned shell (pid " << pid << ") with PTY\n";
 
         auto buf = std::make_shared<std::array<char,4096>>();
-        start_pty_to_ws(pty, ws, buf, pid);
-        start_ws_to_pty(ws, pty, pid);
+        start_pty_to_ws(pty, ws, buf, pid, ioc);
+        start_ws_to_pty(ws, pty, pid, ioc);
 
         // ---- SIGCHLD handler ----
         asio::signal_set sigs(ioc, SIGCHLD);
