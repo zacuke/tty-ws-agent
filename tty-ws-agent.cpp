@@ -15,6 +15,8 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <mutex>
+#include <fcntl.h>
+#include <chrono>
 
 namespace asio      = boost::asio;
 namespace beast     = boost::beast;
@@ -73,7 +75,7 @@ void start_pty_to_ws(std::shared_ptr<asio::posix::stream_descriptor> pty,
                             std::cerr << "[pty->ws] write error: " << ec2.message() << "\n";
                             beast::error_code ignore;
                             pty->close(ignore);
-                            ws->close(websocket::close_code::normal, ignore);
+                            ws->next_layer().next_layer().close(ignore);
                             if (childPid > 0) kill(childPid, SIGTERM);
                             ioc.stop();
                         }
@@ -82,7 +84,7 @@ void start_pty_to_ws(std::shared_ptr<asio::posix::stream_descriptor> pty,
                 std::cerr << "[pty->ws] pipe closed (ec=" << ec.message() << ")\n";
                 beast::error_code ignore;
                 pty->close(ignore);
-                ws->close(websocket::close_code::normal, ignore);
+                ws->next_layer().next_layer().close(ignore);
                 if (childPid>0) kill(childPid,SIGTERM);
                 ioc.stop();
             }
@@ -138,7 +140,7 @@ void start_ws_to_pty(std::shared_ptr<ws_stream> ws,
                             std::cerr << "[ws->pty write error] " << ec2.message() << "\n";
                             beast::error_code ignore;
                             pty->close(ignore);
-                            ws->close(websocket::close_code::normal, ignore);
+                            ws->next_layer().next_layer().close(ignore);
                             if (childPid>0) kill(childPid,SIGTERM);
                             ioc.stop();
                         }
@@ -151,13 +153,45 @@ void start_ws_to_pty(std::shared_ptr<ws_stream> ws,
                 }
                 beast::error_code ignore;
                 pty->close(ignore);
-                ws->close(websocket::close_code::normal, ignore);
+                ws->next_layer().next_layer().close(ignore);
                 if (childPid>0) kill(childPid,SIGTERM);
                 ioc.stop();
             }
         });
 }
 
+// Keepalive ---------------------------------------------------
+void start_ping(std::shared_ptr<ws_stream> ws,
+                asio::steady_timer& timer,
+                asio::io_context& ioc,
+                std::shared_ptr<std::chrono::steady_clock::time_point> last_pong)
+{
+    timer.expires_after(std::chrono::seconds(10)); // interval
+    timer.async_wait([ws, &timer, &ioc, last_pong](beast::error_code ec){
+        if (!ec) {
+            ws->async_ping({}, [ws, &timer, &ioc, last_pong](beast::error_code ec2){
+                if (ec2) {
+                    std::cerr << "[ping] write error: " << ec2.message() << "\n";
+                    beast::error_code ignore;
+                    ws->next_layer().next_layer().close(ignore);
+                    ioc.stop();
+                    return;
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (now - *last_pong > std::chrono::seconds(20)) { // timeout
+                    std::cerr << "[ping] no pong received within 20s, closing.\n";
+                    beast::error_code ignore;
+                    ws->next_layer().next_layer().close(ignore);
+                    ioc.stop();
+                    return;
+                }
+                start_ping(ws, timer, ioc, last_pong);
+            });
+        }
+    });
+}
+
+// main ---------------------------------------------------------
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0]
@@ -200,7 +234,23 @@ int main(int argc, char *argv[]) {
         ws->handshake(host, path);
         std::cout << "Connected to wss://" << host << path << std::endl;
 
-        // Fork PTY with child bash
+        // FD_CLOEXEC -------------------------------------------------
+        {
+            int fd = ws->next_layer().next_layer().native_handle();
+            int flags = fcntl(fd, F_GETFD);
+            fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+        }
+
+        // Last pong tracker
+        auto last_pong = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+        ws->control_callback([last_pong](websocket::frame_type kind, boost::beast::string_view){
+            if (kind == websocket::frame_type::pong) {
+                *last_pong = std::chrono::steady_clock::now();
+                std::cerr << "[ws] Got pong\n";
+            }
+        });
+
+        // Fork PTY with child bash ----------------------------------
         int master_fd;
         pid_t pid = forkpty(&master_fd, nullptr, nullptr, nullptr);
         if (pid == -1) {
@@ -221,7 +271,11 @@ int main(int argc, char *argv[]) {
         start_pty_to_ws(pty, ws, buf, pid, ioc);
         start_ws_to_pty(ws, pty, pid, ioc);
 
-        // ---- SIGCHLD handler ----
+        // Start Ping loop -------------------------------------------
+        asio::steady_timer ping_timer(ioc);
+        start_ping(ws, ping_timer, ioc, last_pong);
+
+        // SIGCHLD handler -------------------------------------------
         asio::signal_set sigs(ioc, SIGCHLD);
         sigs.async_wait([&](beast::error_code, int signo){
             if (signo == SIGCHLD) {
@@ -231,16 +285,16 @@ int main(int argc, char *argv[]) {
                     if (dead == pid) {
                         std::cerr << "[main] child " << pid << " exited\n";
                         beast::error_code ignore;
-                        pty->close(ignore); ws->close(websocket::close_code::normal, ignore);
+                        pty->close(ignore);
+                        ws->next_layer().next_layer().close(ignore);
                         ioc.stop();
                     }
                 }
             }
         });
-        // ------------------------
 
+        // Run --------------------------------------------------------
         ioc.run();
-
         return 0;
     } catch (std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
