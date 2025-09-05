@@ -1,6 +1,7 @@
 name: Build and Release tty-ws-agent
 
 permissions:
+  contents: read 
   packages: write
 
 on:
@@ -34,7 +35,9 @@ jobs:
 
       - name: Set image name
         id: vars
-        run: echo "IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}" >> $GITHUB_OUTPUT
+        run: |
+          echo "IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}" >> $GITHUB_OUTPUT
+          echo "CACHE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}-cache" >> $GITHUB_OUTPUT
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -46,8 +49,8 @@ jobs:
           file: ./.github/Dockerfile.ubuntu${{ matrix.version }}
           push: true
           tags: ${{ steps.vars.outputs.IMAGE }}
-          cache-from: type=registry,ref=${{ steps.vars.outputs.IMAGE }}
-          cache-to: type=registry,ref=${{ steps.vars.outputs.IMAGE }},mode=max
+          cache-from: type=registry,ref=${{ steps.vars.outputs.CACHE_IMAGE }}
+          cache-to: type=registry,ref=${{ steps.vars.outputs.CACHE_IMAGE }},mode=max
 
   # ------------------------------------------------------------
   # Step 2: Build binaries using pinned builder images
@@ -66,6 +69,7 @@ jobs:
       - name: Build binary for Ubuntu ${{ matrix.version }}
         run: |
           IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}
+          docker pull $IMAGE
           docker run --rm -v $(pwd):/src -w /src $IMAGE \
             bash -c "g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu${{ matrix.version }} -lboost_system -lssl -lcrypto -lpthread && strip tty-ws-agent-ubuntu${{ matrix.version }}"
 
