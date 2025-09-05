@@ -1,5 +1,8 @@
 name: Build and Release tty-ws-agent
 
+permissions:
+  packages: write
+
 on:
   release:
     types: [created]
