@@ -4,83 +4,105 @@ on:
   release:
     types: [created]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}/tty-ws-agent-builder
+
 jobs:
-  build-multi-docker:
+  # ------------------------------------------------------------
+  # Step 1: Build & push builder images if Dockerfiles changed
+  # ------------------------------------------------------------
+  build-builder-images:
     runs-on: ubuntu-latest
-    name: Build with Docker containers
-    
+    strategy:
+      matrix:
+        version: [22.04, 24.04]
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Build for Ubuntu 22.04
-      run: |
-        docker run --rm -v $(pwd):/src -w /src ubuntu:22.04 bash -c "
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=UTC
-          apt-get update &&
-          apt-get install -y g++ libboost-all-dev libssl-dev &&
-          g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu22.04 -lboost_system -lssl -lcrypto -lpthread &&
-          strip tty-ws-agent-ubuntu22.04
-        "
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build for Ubuntu 24.04
-      run: |
-        docker run --rm -v $(pwd):/src -w /src ubuntu:24.04 bash -c "
-          export DEBIAN_FRONTEND=noninteractive
-          export TZ=UTC
-          apt-get update &&
-          apt-get install -y g++ libboost-all-dev libssl-dev &&
-          g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu24.04 -lboost_system -lssl -lcrypto -lpthread &&
-          strip tty-ws-agent-ubuntu24.04
-        "
+      - name: Set image name
+        id: vars
+        run: echo "IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}" >> $GITHUB_OUTPUT
 
-    - name: Verify all binaries
-      run: |
-        for version in 22.04 24.04; do
-          echo "=== Ubuntu $version ==="
-          ls -la tty-ws-agent-ubuntu$version
-          file tty-ws-agent-ubuntu$version
-          echo ""
-        done
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-    - name: Upload all artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: tty-ws-agent-binaries
-        path: |
-          tty-ws-agent-ubuntu22.04
-          tty-ws-agent-ubuntu24.04
-        retention-days: 5
+      - name: Build & Push builder image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./.github/Dockerfile.ubuntu${{ matrix.version }}
+          push: true
+          tags: ${{ steps.vars.outputs.IMAGE }}
+          cache-from: type=registry,ref=${{ steps.vars.outputs.IMAGE }}
+          cache-to: type=registry,ref=${{ steps.vars.outputs.IMAGE }},mode=max
 
+  # ------------------------------------------------------------
+  # Step 2: Build binaries using pinned builder images
+  # ------------------------------------------------------------
+  build-multi-docker:
+    needs: build-builder-images
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: [22.04, 24.04]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build binary for Ubuntu ${{ matrix.version }}
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}
+          docker run --rm -v $(pwd):/src -w /src $IMAGE \
+            bash -c "g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu${{ matrix.version }} -lboost_system -lssl -lcrypto -lpthread && strip tty-ws-agent-ubuntu${{ matrix.version }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tty-ws-agent-binaries
+          path: tty-ws-agent-ubuntu${{ matrix.version }}
+          retention-days: 5
+
+  # ------------------------------------------------------------
+  # Step 3: Release binaries as GitHub Release assets
+  # ------------------------------------------------------------
   release:
     needs: build-multi-docker
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
 
     steps:
-    - name: Download artifact bundle
-      uses: actions/download-artifact@v4
-      with:
-        name: tty-ws-agent-binaries
-        path: ./release-bin
+      - name: Download artifact bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: tty-ws-agent-binaries
+          path: ./release-bin
 
-    - name: Upload Ubuntu 22.04 asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./release-bin/tty-ws-agent-ubuntu22.04
-        asset_name: tty-ws-agent-ubuntu22.04
-        asset_content_type: application/octet-stream
+      - name: Upload Ubuntu 22.04 asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./release-bin/tty-ws-agent-ubuntu22.04
+          asset_name: tty-ws-agent-ubuntu22.04
+          asset_content_type: application/octet-stream
 
-    - name: Upload Ubuntu 24.04 asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./release-bin/tty-ws-agent-ubuntu24.04
-        asset_name: tty-ws-agent-ubuntu24.04
-        asset_content_type: application/octet-stream
+      - name: Upload Ubuntu 24.04 asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./release-bin/tty-ws-agent-ubuntu24.04
+          asset_name: tty-ws-agent-ubuntu24.04
+          asset_content_type: application/octet-stream
