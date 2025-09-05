@@ -1,12 +1,12 @@
 name: Build and Release tty-ws-agent
 
-permissions:
-  contents: read 
-  packages: write
-
 on:
   release:
     types: [created]
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io
@@ -14,7 +14,7 @@ env:
 
 jobs:
   # ------------------------------------------------------------
-  # Step 1: Build & push builder images if Dockerfiles changed
+  # Step 1: Build & push builder images
   # ------------------------------------------------------------
   build-builder-images:
     runs-on: ubuntu-latest
@@ -23,8 +23,7 @@ jobs:
         version: [22.04, 24.04]
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v2
@@ -33,14 +32,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image name
+      - name: Set image names
         id: vars
         run: |
           echo "IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}" >> $GITHUB_OUTPUT
-          echo "CACHE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}-cache" >> $GITHUB_OUTPUT
+          echo "CACHE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ matrix.version }}-cache" >> $GITHUB_OUTPUT
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Build & Push builder image
         uses: docker/build-push-action@v5
@@ -49,11 +47,11 @@ jobs:
           file: ./.github/Dockerfile.ubuntu${{ matrix.version }}
           push: true
           tags: ${{ steps.vars.outputs.IMAGE }}
-          cache-from: type=registry,ref=${{ steps.vars.outputs.CACHE_IMAGE }}
-          cache-to: type=registry,ref=${{ steps.vars.outputs.CACHE_IMAGE }},mode=max
+          cache-from: type=registry,ref=${{ steps.vars.outputs.CACHE }}
+          cache-to: type=registry,ref=${{ steps.vars.outputs.CACHE }},mode=max
 
   # ------------------------------------------------------------
-  # Step 2: Build binaries using pinned builder images
+  # Step 2: Compile binaries
   # ------------------------------------------------------------
   build-multi-docker:
     needs: build-builder-images
@@ -63,8 +61,7 @@ jobs:
         version: [22.04, 24.04]
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Build binary for Ubuntu ${{ matrix.version }}
         run: |
@@ -73,43 +70,35 @@ jobs:
           docker run --rm -v $(pwd):/src -w /src $IMAGE \
             bash -c "g++ -std=c++17 -O2 -DNDEBUG tty-ws-agent.cpp -o tty-ws-agent-ubuntu${{ matrix.version }} -lboost_system -lssl -lcrypto -lpthread && strip tty-ws-agent-ubuntu${{ matrix.version }}"
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: tty-ws-agent-binaries
+          name: tty-ws-agent-binaries-${{ matrix.version }}
           path: tty-ws-agent-ubuntu${{ matrix.version }}
           retention-days: 5
 
   # ------------------------------------------------------------
-  # Step 3: Release binaries as GitHub Release assets
+  # Step 3: Release assets (matrix for all versions)
   # ------------------------------------------------------------
   release:
     needs: build-multi-docker
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: [22.04, 24.04]
 
     steps:
-      - name: Download artifact bundle
+      - name: Download binary artifact
         uses: actions/download-artifact@v4
         with:
-          name: tty-ws-agent-binaries
+          name: tty-ws-agent-binaries-${{ matrix.version }}
           path: ./release-bin
 
-      - name: Upload Ubuntu 22.04 asset
+      - name: Upload ${{ matrix.version }} asset
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./release-bin/tty-ws-agent-ubuntu22.04
-          asset_name: tty-ws-agent-ubuntu22.04
-          asset_content_type: application/octet-stream
-
-      - name: Upload Ubuntu 24.04 asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./release-bin/tty-ws-agent-ubuntu24.04
-          asset_name: tty-ws-agent-ubuntu24.04
+          asset_path: ./release-bin/tty-ws-agent-ubuntu${{ matrix.version }}
+          asset_name: tty-ws-agent-ubuntu${{ matrix.version }}
           asset_content_type: application/octet-stream
