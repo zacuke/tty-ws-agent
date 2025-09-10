@@ -260,8 +260,8 @@ int main(int argc, char *argv[]) {
         if (pid == 0) {
             // set TERM
             setenv("TERM", "xterm-256color", 1);
-            execl("/bin/bash", "bash", (char*)nullptr);
-            execl("/bin/sh", "sh", (char*)nullptr);
+            execl("/bin/bash", "bash", "-l", (char*)nullptr);
+            execl("/bin/sh", "sh", "-l", (char*)nullptr);
             _exit(127);
         }
         auto pty = std::make_shared<asio::posix::stream_descriptor>(ioc, master_fd);
